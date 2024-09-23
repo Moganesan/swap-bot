@@ -5,6 +5,7 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@uniswap/v3-periphery/contracts/libraries/TransferHelper.sol";
 import "@uniswap/v3-periphery/contracts/interfaces/IMulticall.sol";
 import "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 import "./Interfaces/IQuoter.sol";
@@ -265,6 +266,100 @@ contract SwapBot is Ownable, ReentrancyGuard {
         path[1] = wtoken;
 
         internalSell(wtoken, swap, payable(msg.sender), path, amount, slippage);
+    }
+
+    function internalSellV3(
+        address wtoken,
+        address token,
+        address swap,
+        address factory,
+        address payable user,
+        uint24 poolFee,
+        uint256 amount,
+        uint256 slippage
+    ) internal nonReentrant {
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Get the pool for the token pair
+        address poolAddress = IUniswapV3Factory(factory).getPool(
+            token,
+            wtoken,
+            poolFee
+        );
+        require(poolAddress != address(0), "Pool does not exist");
+
+        IUniswapV3Pool pool = IUniswapV3Pool(poolAddress);
+
+        // Get current price and liquidity from the pool
+        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        uint128 liquidity = pool.liquidity();
+
+        // Calculate the expected output
+        uint256 expectedOutput = calculateExpectedOutputV3(
+            sqrtPriceX96,
+            liquidity,
+            amount,
+            poolFee
+        );
+
+        // Calculate the minimum acceptable output based on slippage
+        uint256 minOutput = (expectedOutput * (10000 - slippage)) / 10000;
+
+        // Approve the router to spend tokens
+        TransferHelper.safeApprove(token, address(swap), amount);
+
+        // Prepare the swap parameters
+        ISwapRouterV3.ExactInputSingleParams memory params = ISwapRouterV3
+            .ExactInputSingleParams({
+                tokenIn: token,
+                tokenOut: wtoken,
+                fee: poolFee,
+                recipient: address(this),
+                deadline: block.timestamp + 15 minutes,
+                amountIn: amount,
+                amountOutMinimum: minOutput,
+                sqrtPriceLimitX96: 0
+            });
+
+        // Execute the swap
+        uint256 amountOut = ISwapRouterV3(swap).exactInputSingle(params);
+
+        require(amountOut >= minOutput, "Output is less than minimum expected");
+
+        // Transfer the ETH to the user, minus the fee
+        uint256 amountToUser = amountOut;
+        TransferHelper.safeTransferETH(user, amountToUser);
+    }
+
+    function sellTokenV3(
+        address wtoken,
+        address swap,
+        address factory,
+        address token,
+        uint256 amount,
+        uint256 slippage
+    ) external {
+        require(
+            IERC20(token).balanceOf(msg.sender) >= amount,
+            "Insufficient token balance"
+        );
+
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+
+        address[] memory path = new address[](2);
+        path[0] = token;
+        path[1] = wtoken;
+
+        internalSellV3(
+            wtoken,
+            token,
+            swap,
+            factory,
+            payable(msg.sender),
+            3000,
+            amount,
+            slippage
+        );
     }
 
     receive() external payable {}
