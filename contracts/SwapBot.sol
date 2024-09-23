@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@uniswap/v3-periphery/contracts/interfaces/IMulticall.sol";
+import "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 import "./Interfaces/IQuoter.sol";
 import "./Interfaces/ISwapRouterV2.sol";
 import "./Interfaces/ISwapRouterV3.sol";
+import "./Interfaces/IUniswapV3Pool.sol";
 import "./Interfaces/IFactoryV2.sol";
 import "./Interfaces/IFactoryV3.sol";
 import "./Interfaces/IPair.sol";
 
 contract SwapBot is Ownable, ReentrancyGuard {
     uint256 public deadline = type(uint256).max;
-    uint256 public fee = 1;
     address admin;
 
     event AddLiquidityETH(
@@ -29,6 +30,29 @@ contract SwapBot is Ownable, ReentrancyGuard {
 
     constructor() Ownable(msg.sender) {
         admin = address(this);
+    }
+
+    function calculateExpectedOutputV3(
+        uint160 sqrtPriceX96,
+        uint128 liquidity,
+        uint256 amountIn,
+        uint24 fee
+    ) internal pure returns (uint256) {
+        uint256 virtualReserveIn = FullMath.mulDiv(
+            liquidity,
+            1 << 96,
+            sqrtPriceX96
+        );
+        uint256 virtualReserveOut = FullMath.mulDiv(
+            liquidity,
+            sqrtPriceX96,
+            1 << 96
+        );
+
+        uint256 amountInWithFee = amountIn * (1e6 - fee);
+        uint256 numerator = amountInWithFee * virtualReserveOut;
+        uint256 denominator = (virtualReserveIn * 1e6) + amountInWithFee;
+        return numerator / denominator;
     }
 
     function internalBuy(
@@ -77,73 +101,60 @@ contract SwapBot is Ownable, ReentrancyGuard {
 
     function internalBuyV3(
         address wtoken,
+        address token,
         address swap,
-        address user,
         address factory,
-        address quoter,
-        address[] memory path,
+        address user,
+        uint24 fee,
         uint256 amount,
         uint256 slippage
     ) internal nonReentrant {
-        address pairAddr = IUniswapV3Factory(factory).getPool(
-            path[0],
-            path[1],
-            3000
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Get the pool for the token pair
+        address poolAddress = IUniswapV3Factory(factory).getPool(
+            wtoken,
+            token,
+            fee
         );
-        (uint112 reserve0, uint112 reserve1, ) = IPair(pairAddr).getReserves();
+        require(poolAddress != address(0), "Pool does not exist");
 
-        (uint256 ethAmt, uint256 tokenAmt) = (reserve0, reserve1);
-        if (IPair(pairAddr).token0() != wtoken) {
-            (ethAmt, tokenAmt) = (reserve1, reserve0);
-        }
+        IUniswapV3Pool pool = IUniswapV3Pool(poolAddress);
 
-        // Get quote
-        uint256 quoteAmountOut = IQuoter(quoter).quoteExactInputSingle(
-            path[0],
-            path[1],
-            3000, // 0.3% fee
+        // Get current price and liquidity from the pool
+        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        uint128 liquidity = pool.liquidity();
+
+        // Calculate the expected output
+        uint256 expectedOutput = calculateExpectedOutputV3(
+            sqrtPriceX96,
+            liquidity,
             amount,
-            0
+            fee
         );
 
-        // Calculate minAmountOut with slippage tolerance
-        uint256 minAmountOut = (quoteAmountOut * (10000 - slippage)) / 10000;
+        // Calculate the minimum acceptable output based on slippage
+        uint256 minOutput = (expectedOutput * (10000 - slippage)) / 10000;
 
+        // Prepare the swap parameters
         ISwapRouterV3.ExactInputSingleParams memory params = ISwapRouterV3
             .ExactInputSingleParams({
-                tokenIn: address(path[0]),
-                tokenOut: address(path[1]),
-                fee: 3000,
+                tokenIn: wtoken,
+                tokenOut: token,
+                fee: fee,
                 recipient: user,
                 deadline: block.timestamp + 15 minutes,
-                amountIn: msg.value,
-                amountOutMinimum: minAmountOut,
+                amountIn: amount,
+                amountOutMinimum: minOutput,
                 sqrtPriceLimitX96: 0
             });
 
-        bytes[] memory data = new bytes[](1);
-        data[0] = abi.encodeWithSelector(
-            ISwapRouterV3.exactInputSingle.selector,
+        // Execute the swap
+        uint256 amountOut = ISwapRouterV3(swap).exactInputSingle{value: amount}(
             params
         );
 
-        bytes[] memory results = IMulticall(address(ISwapRouterV3(swap)))
-            .multicall{value: amount}(data);
-
-        uint256 output = abi.decode(results[0], (uint256));
-
-        uint256 expect = (amount * tokenAmt) / (ethAmt);
-
-        require(
-            expect > 0,
-            "Expected output amount should be greater than zero"
-        );
-        uint256 differ = ((expect - output) * (100)) / (expect);
-
-        require(
-            differ < slippage,
-            "Trade output is less than minimum expected"
-        );
+        require(amountOut >= minOutput, "Output is less than minimum expected");
     }
 
     function buyToken(
@@ -159,22 +170,14 @@ contract SwapBot is Ownable, ReentrancyGuard {
         path[0] = wtoken;
         path[1] = token;
 
-        internalBuy(
-            wtoken,
-            swap,
-            payable(msg.sender),
-            path,
-            (amount * (100 - fee)) / (100),
-            slippage
-        );
+        internalBuy(wtoken, swap, payable(msg.sender), path, amount, slippage);
     }
 
     function buyTokenV3(
         address wtoken,
         address swap,
-        address factory,
-        address quoter,
         address token,
+        address factory,
         uint256 amount,
         uint256 slippage
     ) external payable {
@@ -186,11 +189,11 @@ contract SwapBot is Ownable, ReentrancyGuard {
 
         internalBuyV3(
             wtoken,
+            token,
             swap,
-            msg.sender,
             factory,
-            quoter,
-            path,
+            msg.sender,
+            3000,
             amount,
             slippage
         );
@@ -240,7 +243,7 @@ contract SwapBot is Ownable, ReentrancyGuard {
             address(this),
             deadline
         );
-        user.transfer((output / 100) * (100 - fee));
+        user.transfer(output);
     }
 
     function sellToken(
@@ -262,70 +265,6 @@ contract SwapBot is Ownable, ReentrancyGuard {
         path[1] = wtoken;
 
         internalSell(wtoken, swap, payable(msg.sender), path, amount, slippage);
-    }
-
-    function estimateSellResult(
-        address wtoken,
-        address swap,
-        address token,
-        uint256 amount,
-        address factoryAddr
-    ) external view returns (uint256 output) {
-        address pairAddr = IFactoryV2(factoryAddr).getPair(token, wtoken);
-        (uint112 reserve0, uint112 reserve1, ) = IPair(pairAddr).getReserves();
-
-        (uint256 ethAmt, uint256 tokenAmt) = (reserve0, reserve1);
-        if (IPair(pairAddr).token0() != wtoken) {
-            (ethAmt, tokenAmt) = (reserve1, reserve0);
-        }
-
-        output =
-            (ISwapRouterV2(swap).getAmountOut(amount, tokenAmt, ethAmt) / 100) *
-            (100 - fee);
-    }
-
-    function addLiquidity(
-        address swapProtocol,
-        address token,
-        uint256 amountEthDesired,
-        uint256 amountTokenDesired,
-        uint256 amountTokenMin,
-        uint256 amountETHMin,
-        address to
-    )
-        external
-        payable
-        onlyOwner
-        returns (uint256 amountToken, uint256 amountETH, uint256 liquidity)
-    {
-        require(
-            msg.value >= amountEthDesired * (1 wei),
-            "Insufficient ETH amount"
-        );
-
-        uint256 etherAmount = amountEthDesired * (1 wei);
-        (amountToken, amountETH, liquidity) = ISwapRouterV2(swapProtocol)
-            .addLiquidityETH{value: etherAmount}(
-            token,
-            amountTokenDesired,
-            amountTokenMin,
-            amountETHMin,
-            to,
-            deadline
-        );
-
-        emit AddLiquidityETH(token, amountToken, amountETH, liquidity);
-    }
-
-    function setFee(uint256 _fee) external onlyOwner {
-        fee = _fee;
-    }
-
-    function withdraw(
-        uint256 _amount,
-        address payable _receiver
-    ) external onlyOwner {
-        _receiver.transfer(_amount);
     }
 
     receive() external payable {}
